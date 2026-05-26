@@ -85,13 +85,25 @@ def _import_objectfolder_modules():
     root_str = str(OBJECTFOLDER_ROOT)
     if root_str not in sys.path:
         sys.path.insert(0, root_str)
+
+    # The model files import these utility modules, but this bridge only needs
+    # the model classes. Stubbing avoids pulling optional spectrogram deps such
+    # as librosa into tactile/audio inference.
+    sys.modules.setdefault("AudioNet_utils", types.ModuleType("AudioNet_utils"))
+    sys.modules.setdefault("TouchNet_utils", types.ModuleType("TouchNet_utils"))
+
     import AudioNet_model
-    import AudioNet_utils
     import TouchNet_model
-    import TouchNet_utils
     from taxim_render import TaximRender
 
-    return AudioNet_model, AudioNet_utils, TouchNet_model, TouchNet_utils, TaximRender
+    return AudioNet_model, TouchNet_model, TaximRender
+
+
+def _strip_prefix_if_present(state_dict: dict, prefix: str) -> dict:
+    keys = sorted(state_dict.keys())
+    if not all(key.startswith(prefix) for key in keys):
+        return state_dict
+    return {key.replace(prefix, ""): value for key, value in state_dict.items()}
 
 
 def _resolve_object_file(object_id: Union[int, str, Path]) -> Path:
@@ -134,20 +146,20 @@ def _load_object_file(object_file_path: Path) -> _LoadedObjectFile:
     if cached is not None:
         return cached
 
-    AudioNet_model, AudioNet_utils, TouchNet_model, TouchNet_utils, TaximRender = _import_objectfolder_modules()
+    AudioNet_model, TouchNet_model, TaximRender = _import_objectfolder_modules()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(object_file_path, map_location="cpu", weights_only=False)
 
     touch_embed_fn, touch_input_ch = TouchNet_model.get_embedder(10, 0)
     touch_model = TouchNet_model.NeRF(D=8, input_ch=touch_input_ch, output_ch=1)
-    touch_state = TouchNet_utils.strip_prefix_if_present(checkpoint["TouchNet"]["model_state_dict"], "module.")
+    touch_state = _strip_prefix_if_present(checkpoint["TouchNet"]["model_state_dict"], "module.")
     touch_model.load_state_dict(touch_state)
     touch_model = touch_model.to(device).eval()
 
     g = int(np.asarray(checkpoint["AudioNet"]["frequencies"]).shape[0])
     audio_embed_fn, audio_input_ch = AudioNet_model.get_embedder(10, 0)
     audio_model = AudioNet_model.AudioNeRF(D=8, input_ch=audio_input_ch, output_ch=g)
-    audio_state = AudioNet_utils.strip_prefix_if_present(checkpoint["AudioNet"]["model_state_dict"], "module.")
+    audio_state = _strip_prefix_if_present(checkpoint["AudioNet"]["model_state_dict"], "module.")
     audio_model.load_state_dict(audio_state)
     audio_model = audio_model.to(device).eval()
 

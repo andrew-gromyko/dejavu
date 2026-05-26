@@ -70,6 +70,9 @@ class ContactResult:
     force_world: np.ndarray
 
 
+PAD_IDS = ("left", "right")
+
+
 def _to_action(env: "BaseEnv", arm_command: np.ndarray, gripper: float):
     from mani_skill.utils import common
 
@@ -111,22 +114,26 @@ def _arm_delta_to_action(ue: "MugContactProbeEnv", ee_delta_world: np.ndarray) -
     return np.clip(ee_delta_world, raw_lower, raw_upper)
 
 
-def _extract_mug_contact(env: "MugContactProbeEnv", min_force_n: float = 0.05) -> Optional[ContactResult]:
+def _extract_mug_contacts(env: "MugContactProbeEnv", min_force_n: float = 0.05) -> dict[str, ContactResult]:
     contacts = env.scene.get_contacts()
 
     mug_body = env.mug._bodies[0]
-    finger_bodies = {env.agent.finger1_link._bodies[0], env.agent.finger2_link._bodies[0]}
+    finger_body_to_pad = {
+        env.agent.finger1_link._bodies[0]: "left",
+        env.agent.finger2_link._bodies[0]: "right",
+    }
     dt = float(env.scene.px.timestep)
 
-    best: Optional[ContactResult] = None
-    best_force_norm = -np.inf
+    best: dict[str, ContactResult] = {}
+    best_force_norm = {pad_id: -np.inf for pad_id in PAD_IDS}
 
     for contact in contacts:
         b0, b1 = contact.bodies
-        mug_first = b0 == mug_body and b1 in finger_bodies
-        mug_second = b1 == mug_body and b0 in finger_bodies
+        mug_first = b0 == mug_body and b1 in finger_body_to_pad
+        mug_second = b1 == mug_body and b0 in finger_body_to_pad
         if not (mug_first or mug_second):
             continue
+        pad_id = finger_body_to_pad[b1 if mug_first else b0]
 
         for pt in contact.points:
             impulse = np.asarray(pt.impulse, dtype=np.float64)
@@ -134,21 +141,37 @@ def _extract_mug_contact(env: "MugContactProbeEnv", min_force_n: float = 0.05) -
                 impulse = -impulse
             force = impulse / dt
             force_norm = np.linalg.norm(force)
-            if force_norm < min_force_n or force_norm <= best_force_norm:
+            if force_norm < min_force_n or force_norm <= best_force_norm[pad_id]:
                 continue
 
             world_point = np.asarray(pt.position, dtype=np.float64)
             t_mug_inv = np.linalg.inv(env.mug.pose[0].sp.to_transformation_matrix())
             local_h = t_mug_inv @ np.array([world_point[0], world_point[1], world_point[2], 1.0])
 
-            best = ContactResult(
+            best[pad_id] = ContactResult(
                 world_point=world_point,
                 local_point=local_h[:3],
                 force_world=np.asarray(force, dtype=np.float64),
             )
-            best_force_norm = force_norm
+            best_force_norm[pad_id] = force_norm
 
     return best
+
+
+def _pad_contact_force_norms(env: "MugContactProbeEnv") -> dict[str, float]:
+    pad_links = {
+        "left": env.agent.finger1_link,
+        "right": env.agent.finger2_link,
+    }
+    force_norms = {}
+    for pad_id, link in pad_links.items():
+        pair_force = env.scene.get_pairwise_contact_forces(link, env.mug)
+        force_norms[pad_id] = float(np.linalg.norm(pair_force[0].detach().cpu().numpy()))
+    return force_norms
+
+
+def _press_depth_from_force(force_norm_n: float) -> float:
+    return 0.0005 + (0.0020 - 0.0005) * min(force_norm_n / 4.0, 1.0)
 
 
 def _to_uint8_rgb(image: np.ndarray) -> np.ndarray:
@@ -309,6 +332,7 @@ def main() -> None:
         env.render()
 
     contact: Optional[ContactResult] = None
+    contacts_by_pad: dict[str, Optional[ContactResult]] = {pad_id: None for pad_id in PAD_IDS}
     contact_rgb: Optional[np.ndarray] = None
     touch_step: Optional[int] = None
     mug_z_at_touch: Optional[float] = None
@@ -316,35 +340,56 @@ def main() -> None:
     control_step = 0
     terminated_early = False
 
-    tactile_rgb = neutral_tactile
-    tactile_request_pending = False
-    audio_waveform: Optional[np.ndarray] = None
-    audio_play_start_time: Optional[float] = None
+    tactile_rgbs: dict[str, Optional[np.ndarray]] = {pad_id: neutral_tactile for pad_id in PAD_IDS}
+    tactile_request_pending = {pad_id: False for pad_id in PAD_IDS}
+    audio_waveforms: dict[str, Optional[np.ndarray]] = {pad_id: None for pad_id in PAD_IDS}
+    audio_play_start_times: dict[str, Optional[float]] = {pad_id: None for pad_id in PAD_IDS}
+    was_contact_active = {pad_id: False for pad_id in PAD_IDS}
 
     def _drain_worker_responses() -> None:
-        nonlocal tactile_rgb, tactile_request_pending, audio_waveform, audio_play_start_time
         if worker is None:
             return
         try:
             while True:
                 response = response_queue.get_nowait()
                 if len(response) == 3:
-                    resp_type, _, resp_val = response
+                    resp_type, pad_id, resp_val = response
                 else:
                     resp_type, resp_val = response
+                    pad_id = "left"
 
                 if resp_type == "tactile":
-                    tactile_rgb = resp_val
-                    tactile_request_pending = False
+                    if pad_id in tactile_rgbs:
+                        tactile_rgbs[pad_id] = resp_val
+                        tactile_request_pending[pad_id] = False
                 elif resp_type == "audio":
-                    audio_waveform = resp_val
-                    audio_play_start_time = time.time()
+                    if pad_id in audio_waveforms:
+                        audio_waveforms[pad_id] = resp_val
+                        audio_play_start_times[pad_id] = time.time()
         except queue.Empty:
             pass
 
+    def _make_dashboard_payload(active_contacts: dict[str, Optional[ContactResult]]) -> DashboardPayload:
+        return DashboardPayload(
+            video_rgb=video_rgb,
+            control_step=control_step,
+            max_steps=args.max_steps,
+            tactile_rgbs=tactile_rgbs,
+            audio_waveforms=audio_waveforms,
+            audio_play_start_times=audio_play_start_times,
+            contact_active={pad_id: active_contacts.get(pad_id) is not None for pad_id in PAD_IDS},
+            force_norm_n={
+                pad_id: float(np.linalg.norm(active_contacts[pad_id].force_world))
+                if active_contacts.get(pad_id) is not None
+                else 0.0
+                for pad_id in PAD_IDS
+            },
+            is_grasping=bool(ue.agent.is_grasping(ue.mug)[0].item()),
+        )
+
     def step_with_target(target: np.ndarray, gripper: float, max_delta_m: float) -> bool:
         nonlocal video_rgb, control_step, contact, contact_rgb, touch_step, mug_z_at_touch, mug_z_max
-        nonlocal tactile_rgb, tactile_request_pending, audio_waveform, audio_play_start_time
+        nonlocal contacts_by_pad, audio_play_start_times
 
         if control_step >= args.max_steps:
             return False
@@ -367,59 +412,66 @@ def main() -> None:
 
         _drain_worker_responses()
 
-        current_contact = _extract_mug_contact(ue, min_force_n=0.0)
-        pair_force = (
-            ue.scene.get_pairwise_contact_forces(ue.agent.finger1_link, ue.mug)
-            + ue.scene.get_pairwise_contact_forces(ue.agent.finger2_link, ue.mug)
-        )
-        pair_force_norm = float(np.linalg.norm(pair_force[0].detach().cpu().numpy()))
+        current_contacts = _extract_mug_contacts(ue, min_force_n=0.0)
+        pad_force_norms = _pad_contact_force_norms(ue)
+        active_contacts = {
+            pad_id: current_contacts.get(pad_id)
+            if current_contacts.get(pad_id) is not None and pad_force_norms[pad_id] > 1e-6
+            else None
+            for pad_id in PAD_IDS
+        }
+        contacts_by_pad = active_contacts
 
-        if current_contact is not None and pair_force_norm > 1e-6:
+        if any(active_contacts.values()):
             if touch_step is None:
                 touch_step = control_step
                 mug_z_at_touch = float(ue.mug.pose.p[0, 2].item())
-                contact = current_contact
+                contact = next(c for c in active_contacts.values() if c is not None)
                 contact_rgb = video_rgb.copy()
-                print(f"Contact detected at step {control_step}. Dispatching impact sound query...")
+                active_pad_names = ", ".join(pad_id for pad_id, pad_contact in active_contacts.items() if pad_contact is not None)
+                print(f"Contact detected at step {control_step} on {active_pad_names}.")
 
-                if worker is not None:
-                    force_norm = float(np.linalg.norm(current_contact.force_world))
-                    press_depth = 0.0005 + (0.0020 - 0.0005) * min(force_norm / 4.0, 1.0)
+            for pad_id, pad_contact in active_contacts.items():
+                if pad_contact is None:
+                    tactile_rgbs[pad_id] = neutral_tactile
+                    tactile_request_pending[pad_id] = False
+                    was_contact_active[pad_id] = False
+                    continue
+
+                force_norm = float(np.linalg.norm(pad_contact.force_world))
+                press_depth = _press_depth_from_force(force_norm)
+
+                if worker is not None and not was_contact_active[pad_id]:
+                    print(f"{pad_id} pad contact onset at step {control_step}. Dispatching impact sound query...")
                     request_queue.put(
                         {
                             "type": "audio",
-                            "local_point": current_contact.local_point,
+                            "pad_id": pad_id,
+                            "local_point": pad_contact.local_point,
                             "press_depth": press_depth,
                         }
                     )
 
-            if worker is not None and not tactile_request_pending:
-                force_norm = float(np.linalg.norm(current_contact.force_world))
-                press_depth = 0.0005 + (0.0020 - 0.0005) * min(force_norm / 4.0, 1.0)
-                request_queue.put(
-                    {
-                        "type": "tactile",
-                        "local_point": current_contact.local_point,
-                        "press_depth": press_depth,
-                    }
-                )
-                tactile_request_pending = True
+                if worker is not None and not tactile_request_pending[pad_id]:
+                    request_queue.put(
+                        {
+                            "type": "tactile",
+                            "pad_id": pad_id,
+                            "local_point": pad_contact.local_point,
+                            "press_depth": press_depth,
+                        }
+                    )
+                    tactile_request_pending[pad_id] = True
+
+                was_contact_active[pad_id] = True
         else:
-            tactile_rgb = neutral_tactile
+            for pad_id in PAD_IDS:
+                tactile_rgbs[pad_id] = neutral_tactile
+                tactile_request_pending[pad_id] = False
+                was_contact_active[pad_id] = False
 
         if dashboard.enabled:
-            force_norm_n = float(np.linalg.norm(current_contact.force_world)) if current_contact is not None else 0.0
-            dashboard_payload = DashboardPayload(
-                video_rgb=video_rgb,
-                control_step=control_step,
-                max_steps=args.max_steps,
-                tactile_rgb=tactile_rgb,
-                audio_waveform=audio_waveform,
-                audio_play_start_time=audio_play_start_time,
-                contact_active=current_contact is not None,
-                force_norm_n=force_norm_n,
-                is_grasping=bool(ue.agent.is_grasping(ue.mug)[0].item()),
-            )
+            dashboard_payload = _make_dashboard_payload(active_contacts)
             keep_running, updated_audio_start = dashboard.render(dashboard_payload)
             if not keep_running:
                 if worker is not None:
@@ -428,7 +480,8 @@ def main() -> None:
                 dashboard.close()
                 env.close()
                 sys.exit(0)
-            audio_play_start_time = updated_audio_start
+            if updated_audio_start is not None:
+                audio_play_start_times = updated_audio_start
 
         # Cap frame rate at 30 FPS for smooth rendering.
         t_elapsed = time.time() - t_start
@@ -537,6 +590,14 @@ def main() -> None:
     print("Contact point (world):", np.array2string(contact.world_point, precision=6))
     print("Contact point (mug local):", np.array2string(contact.local_point, precision=6))
     print("Contact force (world, N):", np.array2string(contact.force_world, precision=6))
+    for pad_id in PAD_IDS:
+        pad_contact = contacts_by_pad.get(pad_id)
+        if pad_contact is None:
+            print(f"{pad_id.capitalize()} pad final contact: none")
+            continue
+        print(f"{pad_id.capitalize()} pad contact point (world):", np.array2string(pad_contact.world_point, precision=6))
+        print(f"{pad_id.capitalize()} pad contact point (mug local):", np.array2string(pad_contact.local_point, precision=6))
+        print(f"{pad_id.capitalize()} pad contact force (world, N):", np.array2string(pad_contact.force_world, precision=6))
 
     mug_z_final = float(ue.mug.pose.p[0, 2].item())
     if mug_z_at_touch is not None:
@@ -551,26 +612,23 @@ def main() -> None:
 
     if dashboard.enabled:
         print("\nTrajectory complete. Press 'q' or ESC in the dashboard window to exit.")
-        current_contact = _extract_mug_contact(ue, min_force_n=0.0)
+        current_contacts = _extract_mug_contacts(ue, min_force_n=0.0)
+        pad_force_norms = _pad_contact_force_norms(ue)
+        contacts_by_pad = {
+            pad_id: current_contacts.get(pad_id)
+            if current_contacts.get(pad_id) is not None and pad_force_norms[pad_id] > 1e-6
+            else None
+            for pad_id in PAD_IDS
+        }
         while True:
             _drain_worker_responses()
 
-            force_norm_n = float(np.linalg.norm(current_contact.force_world)) if current_contact is not None else 0.0
-            dashboard_payload = DashboardPayload(
-                video_rgb=video_rgb,
-                control_step=control_step,
-                max_steps=args.max_steps,
-                tactile_rgb=tactile_rgb,
-                audio_waveform=audio_waveform,
-                audio_play_start_time=audio_play_start_time,
-                contact_active=current_contact is not None,
-                force_norm_n=force_norm_n,
-                is_grasping=bool(ue.agent.is_grasping(ue.mug)[0].item()),
-            )
+            dashboard_payload = _make_dashboard_payload(contacts_by_pad)
             keep_running, updated_audio_start = dashboard.render(dashboard_payload)
             if not keep_running:
                 break
-            audio_play_start_time = updated_audio_start
+            if updated_audio_start is not None:
+                audio_play_start_times = updated_audio_start
             time.sleep(0.03)
 
     if worker is not None:
