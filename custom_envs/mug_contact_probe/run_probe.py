@@ -15,6 +15,7 @@ from typing import Optional, TYPE_CHECKING
 
 import imageio.v3 as iio
 import numpy as np
+
 from custom_envs.mug_contact_probe.dashboard import DashboardPayload, DashboardPresenter
 from custom_envs.mug_contact_probe.objectfolder_worker import objectfolder_worker
 
@@ -90,8 +91,8 @@ def _grasp_center_world(ue: "MugContactProbeEnv") -> np.ndarray:
     mesh = ue.mug.get_first_collision_mesh()
     bounds = np.asarray(mesh.bounding_box.bounds, dtype=np.float64)
     local_center = 0.5 * (bounds[0] + bounds[1])
-    T_world_mug = ue.mug.pose[0].sp.to_transformation_matrix()
-    center_h = T_world_mug @ np.array([local_center[0], local_center[1], local_center[2], 1.0], dtype=np.float64)
+    t_world_mug = ue.mug.pose[0].sp.to_transformation_matrix()
+    center_h = t_world_mug @ np.array([local_center[0], local_center[1], local_center[2], 1.0], dtype=np.float64)
     return center_h[:3]
 
 
@@ -137,8 +138,8 @@ def _extract_mug_contact(env: "MugContactProbeEnv", min_force_n: float = 0.05) -
                 continue
 
             world_point = np.asarray(pt.position, dtype=np.float64)
-            T_mug_inv = np.linalg.inv(env.mug.pose[0].sp.to_transformation_matrix())
-            local_h = T_mug_inv @ np.array([world_point[0], world_point[1], world_point[2], 1.0])
+            t_mug_inv = np.linalg.inv(env.mug.pose[0].sp.to_transformation_matrix())
+            local_h = t_mug_inv @ np.array([world_point[0], world_point[1], world_point[2], 1.0])
 
             best = ContactResult(
                 world_point=world_point,
@@ -154,8 +155,7 @@ def _to_uint8_rgb(image: np.ndarray) -> np.ndarray:
     rgb = np.asarray(image[..., :3])
 
     if np.issubdtype(rgb.dtype, np.floating):
-        # SAPIEN float RGB textures are in [0, 1]. Convert each frame
-        # independently; temporal pixel repair creates visible trails at motion edges.
+        # SAPIEN float RGB textures are in [0, 1]. Convert each frame independently.
         rgb = np.nan_to_num(rgb, nan=0.0, posinf=1.0, neginf=0.0)
         if float(np.max(rgb)) <= 1.0:
             rgb = rgb * 255.0
@@ -223,7 +223,7 @@ def _parse_args() -> argparse.Namespace:
         "--render-settle-frames",
         type=int,
         default=2,
-        help="Render the video camera this many times and display the last frame; helps avoid stale tiled readback artifacts.",
+        help="Render the video camera this many times and display the last frame.",
     )
     return parser.parse_args()
 
@@ -242,7 +242,7 @@ def main() -> None:
     import multiprocessing
 
     try:
-        multiprocessing.set_start_method('spawn', force=True)
+        multiprocessing.set_start_method("spawn", force=True)
     except RuntimeError:
         pass
 
@@ -256,20 +256,27 @@ def main() -> None:
         worker = multiprocessing.Process(
             target=objectfolder_worker,
             args=(request_queue, response_queue, args.objectfolder_object_id),
-            daemon=True
+            daemon=True,
         )
         worker.start()
 
-        # Request neutral tactile frame
-        request_queue.put({
-            'type': 'tactile',
-            'local_point': np.array([0.0, 0.0, 0.0], dtype=np.float32),
-            'press_depth': 0.0005
-        })
+        # Request neutral tactile frame.
+        request_queue.put(
+            {
+                "type": "tactile",
+                "pad_id": "neutral",
+                "local_point": np.array([0.0, 0.0, 0.0], dtype=np.float32),
+                "press_depth": 0.0005,
+            }
+        )
 
         print("Waiting for background worker to load models and return neutral frame...")
         try:
-            _, neutral_tactile = response_queue.get(timeout=30)
+            response = response_queue.get(timeout=30)
+            if len(response) == 3:
+                _, _, neutral_tactile = response
+            else:
+                _, neutral_tactile = response
             print("Background worker initialized successfully.")
         except Exception as e:
             print(f"Error: background worker failed to start within timeout: {e}", file=sys.stderr)
@@ -290,6 +297,7 @@ def main() -> None:
     video_rgb = _render_video_rgb(ue, settle_frames=args.render_settle_frames)
     dashboard = DashboardPresenter(enabled=not args.no_dashboard, backend=args.dashboard_backend)
     dashboard.start()
+
     show_native_viewer = args.render_mode == "human" and not dashboard.enabled
     if args.render_mode == "human" and dashboard.enabled:
         print(
@@ -313,9 +321,31 @@ def main() -> None:
     audio_waveform: Optional[np.ndarray] = None
     audio_play_start_time: Optional[float] = None
 
+    def _drain_worker_responses() -> None:
+        nonlocal tactile_rgb, tactile_request_pending, audio_waveform, audio_play_start_time
+        if worker is None:
+            return
+        try:
+            while True:
+                response = response_queue.get_nowait()
+                if len(response) == 3:
+                    resp_type, _, resp_val = response
+                else:
+                    resp_type, resp_val = response
+
+                if resp_type == "tactile":
+                    tactile_rgb = resp_val
+                    tactile_request_pending = False
+                elif resp_type == "audio":
+                    audio_waveform = resp_val
+                    audio_play_start_time = time.time()
+        except queue.Empty:
+            pass
+
     def step_with_target(target: np.ndarray, gripper: float, max_delta_m: float) -> bool:
         nonlocal video_rgb, control_step, contact, contact_rgb, touch_step, mug_z_at_touch, mug_z_max
         nonlocal tactile_rgb, tactile_request_pending, audio_waveform, audio_play_start_time
+
         if control_step >= args.max_steps:
             return False
 
@@ -331,24 +361,12 @@ def main() -> None:
         if show_native_viewer:
             env.render()
         control_step += 1
+
         mug_z_max = max(mug_z_max, float(ue.mug.pose.p[0, 2].item()))
         video_rgb = _render_video_rgb(ue, settle_frames=args.render_settle_frames)
 
-        # Check for async responses from the background worker
-        if worker is not None:
-            try:
-                while True:
-                    resp_type, resp_val = response_queue.get_nowait()
-                    if resp_type == 'tactile':
-                        tactile_rgb = resp_val
-                        tactile_request_pending = False
-                    elif resp_type == 'audio':
-                        audio_waveform = resp_val
-                        audio_play_start_time = time.time()
-            except queue.Empty:
-                pass
+        _drain_worker_responses()
 
-        # Snapshot at first non-zero finger-to-mug contact.
         current_contact = _extract_mug_contact(ue, min_force_n=0.0)
         pair_force = (
             ue.scene.get_pairwise_contact_forces(ue.agent.finger1_link, ue.mug)
@@ -364,25 +382,27 @@ def main() -> None:
                 contact_rgb = video_rgb.copy()
                 print(f"Contact detected at step {control_step}. Dispatching impact sound query...")
 
-                # Send audio query to background worker
                 if worker is not None:
                     force_norm = float(np.linalg.norm(current_contact.force_world))
                     press_depth = 0.0005 + (0.0020 - 0.0005) * min(force_norm / 4.0, 1.0)
-                    request_queue.put({
-                        'type': 'audio',
-                        'local_point': current_contact.local_point,
-                        'press_depth': press_depth
-                    })
+                    request_queue.put(
+                        {
+                            "type": "audio",
+                            "local_point": current_contact.local_point,
+                            "press_depth": press_depth,
+                        }
+                    )
 
-            # Send tactile query to background worker
             if worker is not None and not tactile_request_pending:
                 force_norm = float(np.linalg.norm(current_contact.force_world))
                 press_depth = 0.0005 + (0.0020 - 0.0005) * min(force_norm / 4.0, 1.0)
-                request_queue.put({
-                    'type': 'tactile',
-                    'local_point': current_contact.local_point,
-                    'press_depth': press_depth
-                })
+                request_queue.put(
+                    {
+                        "type": "tactile",
+                        "local_point": current_contact.local_point,
+                        "press_depth": press_depth,
+                    }
+                )
                 tactile_request_pending = True
         else:
             tactile_rgb = neutral_tactile
@@ -400,17 +420,17 @@ def main() -> None:
                 force_norm_n=force_norm_n,
                 is_grasping=bool(ue.agent.is_grasping(ue.mug)[0].item()),
             )
-            res = dashboard.render(dashboard_payload)
-            if res == (None, None) or res[0] is False:
+            keep_running, updated_audio_start = dashboard.render(dashboard_payload)
+            if not keep_running:
                 if worker is not None:
                     request_queue.put(None)
                     worker.join()
                 dashboard.close()
                 env.close()
                 sys.exit(0)
-            _, audio_play_start_time = res
+            audio_play_start_time = updated_audio_start
 
-        # Cap frame rate at 30 FPS for smooth rendering
+        # Cap frame rate at 30 FPS for smooth rendering.
         t_elapsed = time.time() - t_start
         target_dt = 0.033
         if t_elapsed < target_dt:
@@ -468,21 +488,18 @@ def main() -> None:
             terminated_early = True
 
     if not terminated_early:
-        # Pause before closure to avoid grabbing while still moving.
         for _ in range(16):
             if not step_with_target(grasp_target, gripper=1.0, max_delta_m=0.004):
                 terminated_early = True
                 break
 
     if not terminated_early:
-        # Close while actively holding the same Cartesian target.
         for _ in range(56):
             if not step_with_target(grasp_target, gripper=-1.0, max_delta_m=0.003):
                 terminated_early = True
                 break
 
     if not terminated_early:
-        # Brief squeeze-settle before lifting.
         for _ in range(20):
             if not step_with_target(grasp_target, gripper=-1.0, max_delta_m=0.003):
                 terminated_early = True
@@ -501,10 +518,11 @@ def main() -> None:
                 terminated_early = True
                 break
 
-    rgb_dir = Path("/Users/andrew/Documents/git/maniskill/runs/mug_contact_probe")
+    rgb_dir = root / "runs" / "mug_contact_probe"
     rgb_dir.mkdir(parents=True, exist_ok=True)
     rgb_first_contact_path = rgb_dir / "probe_rgb_first_contact.png"
     rgb_final_path = rgb_dir / "probe_rgb_final.png"
+
     iio.imwrite(rgb_final_path, video_rgb)
     if contact_rgb is not None:
         iio.imwrite(rgb_first_contact_path, contact_rgb)
@@ -519,48 +537,46 @@ def main() -> None:
     print("Contact point (world):", np.array2string(contact.world_point, precision=6))
     print("Contact point (mug local):", np.array2string(contact.local_point, precision=6))
     print("Contact force (world, N):", np.array2string(contact.force_world, precision=6))
-    for pad_id in PAD_IDS:
-        pad_contact = contacts_by_pad.get(pad_id)
-        if pad_contact is None:
-            print(f"{pad_id.capitalize()} pad final contact: none")
-            continue
-        print(f"{pad_id.capitalize()} pad contact point (world):", np.array2string(pad_contact.world_point, precision=6))
-        print(f"{pad_id.capitalize()} pad contact point (mug local):", np.array2string(pad_contact.local_point, precision=6))
-        print(f"{pad_id.capitalize()} pad contact force (world, N):", np.array2string(pad_contact.force_world, precision=6))
+
     mug_z_final = float(ue.mug.pose.p[0, 2].item())
     if mug_z_at_touch is not None:
         print(f"Mug z at touch: {mug_z_at_touch:.6f}")
         print(f"Mug z max after touch: {mug_z_max:.6f}")
         print(f"Mug z final: {mug_z_final:.6f}")
         print(f"Mug lift delta after touch: {mug_z_final - mug_z_at_touch:.6f} m")
+
     print(f"Grasping at end: {bool(ue.agent.is_grasping(ue.mug)[0].item())}")
     print(f"Saved first-contact RGB: {rgb_first_contact_path}")
     print(f"Saved final RGB: {rgb_final_path}")
 
-    # Keep dashboard open at end until user decides to close it
     if dashboard.enabled:
         print("\nTrajectory complete. Press 'q' or ESC in the dashboard window to exit.")
-        current_contacts = _extract_mug_contacts(ue, min_force_n=0.0)
-        pad_force_norms = _pad_contact_force_norms(ue)
-        contacts_by_pad = {
-            pad_id: current_contacts.get(pad_id)
-            if current_contacts.get(pad_id) is not None and pad_force_norms[pad_id] > 1e-6
-            else None
-            for pad_id in PAD_IDS
-        }
+        current_contact = _extract_mug_contact(ue, min_force_n=0.0)
         while True:
-            drain_worker_responses()
+            _drain_worker_responses()
 
-            dashboard_payload = make_dashboard_payload(contacts_by_pad)
-            res = dashboard.render(dashboard_payload)
-            if res == (None, None) or res[0] is False:
+            force_norm_n = float(np.linalg.norm(current_contact.force_world)) if current_contact is not None else 0.0
+            dashboard_payload = DashboardPayload(
+                video_rgb=video_rgb,
+                control_step=control_step,
+                max_steps=args.max_steps,
+                tactile_rgb=tactile_rgb,
+                audio_waveform=audio_waveform,
+                audio_play_start_time=audio_play_start_time,
+                contact_active=current_contact is not None,
+                force_norm_n=force_norm_n,
+                is_grasping=bool(ue.agent.is_grasping(ue.mug)[0].item()),
+            )
+            keep_running, updated_audio_start = dashboard.render(dashboard_payload)
+            if not keep_running:
                 break
-            _, audio_play_start_times = res
+            audio_play_start_time = updated_audio_start
             time.sleep(0.03)
 
     if worker is not None:
         request_queue.put(None)
         worker.join()
+
     dashboard.close()
     env.close()
 
