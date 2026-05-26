@@ -1,0 +1,9 @@
+# Core dependencies for local custom ManiSkill envs and mug_contact_probe.
+mani_skill
+sapien
+numpy
+torch
+gymnasium
+opencv-python
+imageio
+scipy

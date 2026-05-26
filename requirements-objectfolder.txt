@@ -1,0 +1,12 @@
+# Optional extras for ObjectFolder tactile/audio rendering in mug_contact_probe.
+-r requirements.txt
+
+# ObjectFolder module imports
+configargparse
+librosa
+matplotlib
+scikit-image
+tqdm
+torchvision
+imageio-ffmpeg
+PyYAML
