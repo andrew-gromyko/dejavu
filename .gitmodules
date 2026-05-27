@@ -1,9 +1,6 @@
 [submodule "third_party/UniTouch"]
 	path = third_party/UniTouch
 	url = https://github.com/cfeng16/UniTouch.git
-[submodule "third_party/mplib_src"]
-	path = third_party/mplib_src
-	url = https://github.com/haosulab/MPlib.git
 [submodule "third_party/ObjectFolder"]
 	path = third_party/ObjectFolder
 	url = https://github.com/rhgao/ObjectFolder.git

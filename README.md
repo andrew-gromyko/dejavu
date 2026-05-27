@@ -72,7 +72,7 @@ If you only want RGB/contact probing, use `--skip-objectfolder` and no assets ar
 - `custom_envs/`: local environments and probe runners.
 - `assets/`: checkpoints and object files used by optional multimodal features.
 - `runs/`: generated outputs (images, logs, videos, wav files).
-- `third_party/`: git submodules (ObjectFolder, UniTouch, mplib).
+- `third_party/`: git submodules (ObjectFolder, UniTouch).
 
 ## Notes
 
