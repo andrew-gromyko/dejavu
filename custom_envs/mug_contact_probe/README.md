@@ -39,6 +39,18 @@ Native ManiSkill viewer only:
 python -m custom_envs.mug_contact_probe.run_probe --render-mode human --no-dashboard
 ```
 
+DejaVu memory benchmark viewer:
+
+```bash
+python -m custom_envs.mug_contact_probe.run_dejavu_viewer --task material --H 4 --D 2 --seed 22
+```
+
+Print the generated DejaVu episode without starting ManiSkill:
+
+```bash
+python -m custom_envs.mug_contact_probe.run_dejavu_viewer --task material --H 4 --D 2 --seed 22 --dry-run
+```
+
 ## Outputs
 
 - Prints first-contact world/local point and force.
@@ -49,6 +61,9 @@ python -m custom_envs.mug_contact_probe.run_probe --render-mode human --no-dashb
 ## Code Layout
 
 - `env.py`: environment definition.
+- `dejavu_env.py`: reproducible DejaVu encounter/query generator.
+- `dejavu_ms3_env.py`: ManiSkill3 visualization environment for DejaVu episodes.
+- `run_dejavu_viewer.py`: scripted Panda viewer for DejaVu encounter actions.
 - `run_probe.py`: scripted trajectory + orchestration.
 - `dashboard.py`: dashboard composition and display backends.
 - `objectfolder_worker.py`: background tactile/audio worker process.

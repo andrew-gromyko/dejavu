@@ -19,28 +19,15 @@ def _prefer_venv_cmeel_libs() -> None:
 
     cmeel_lib_s = str(cmeel_lib)
     old_dyld = os.environ.get("DYLD_LIBRARY_PATH")
-    if old_dyld and not old_dyld.split(":")[0] == cmeel_lib_s and not os.environ.get("CUSTOM_ENVS_DYLD_REEXEC"):
-        env = os.environ.copy()
-        paths = [cmeel_lib_s]
-        paths.extend(p for p in old_dyld.split(":") if p and p != cmeel_lib_s)
-        env["DYLD_LIBRARY_PATH"] = ":".join(paths)
-        env["CUSTOM_ENVS_DYLD_REEXEC"] = "1"
-        if sys.argv and sys.argv[0] == "-m":
-            os.execve(
-                sys.executable,
-                [sys.executable, "-m", "custom_envs.mug_contact_probe.run_probe", *sys.argv[1:]],
-                env,
-            )
-        os.execve(sys.executable, [sys.executable, *sys.argv], env)
-
     paths = [cmeel_lib_s]
     if old_dyld:
         paths.extend(p for p in old_dyld.split(":") if p and p != cmeel_lib_s)
     os.environ["DYLD_LIBRARY_PATH"] = ":".join(paths)
 
 
-_prefer_venv_cmeel_libs()
+from .mug_contact_probe import DejaVuEnv
 
-from .mug_contact_probe import MugContactProbeEnv
+DejaVuMemoryEnv = None
+MugContactProbeEnv = None
 
-__all__ = ["MugContactProbeEnv"]
+__all__ = ["DejaVuEnv", "DejaVuMemoryEnv", "MugContactProbeEnv"]

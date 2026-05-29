@@ -1,5 +1,8 @@
 """Mug-contact-probe environment package."""
 
-from .env import MugContactProbeEnv
+from .dejavu_env import DejaVuEnv
 
-__all__ = ["MugContactProbeEnv"]
+DejaVuMemoryEnv = None
+MugContactProbeEnv = None
+
+__all__ = ["DejaVuEnv", "DejaVuMemoryEnv", "MugContactProbeEnv"]

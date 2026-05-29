@@ -5,6 +5,8 @@ from __future__ import annotations
 import threading
 import time
 import webbrowser
+import platform
+import subprocess
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Mapping, Optional
@@ -300,9 +302,42 @@ class DashboardPresenter:
             self.browser = BrowserDashboard()
             self.browser.start()
             print(f"Dashboard available at {self.browser.url}")
-            webbrowser.open(self.browser.url)
+            self._open_dashboard_url(self.browser.url)
         else:
             cv2.namedWindow(self.window_name, cv2.WINDOW_AUTOSIZE)
+
+    def _open_dashboard_url(self, url: str) -> None:
+        system = platform.system()
+        if system == "Darwin":
+            try:
+                subprocess.Popen(["open", "-a", "Google Chrome", url])
+                print("Opened dashboard in Google Chrome.")
+                return
+            except Exception:
+                pass
+
+        try:
+            if webbrowser.open(url, new=2):
+                print("Opened dashboard in default browser.")
+                return
+        except Exception:
+            pass
+
+        try:
+            if system == "Darwin":
+                subprocess.Popen(["open", url])
+                print("Opened dashboard via macOS launcher.")
+                return
+            if system == "Windows":
+                subprocess.Popen(["cmd", "/c", "start", "", url])
+                print("Opened dashboard via Windows launcher.")
+                return
+            subprocess.Popen(["xdg-open", url])
+            print("Opened dashboard via xdg-open.")
+            return
+        except Exception:
+            pass
+        print(f"Unable to auto-open browser. Open this URL manually: {url}")
 
     def render(self, payload: DashboardPayload) -> tuple[bool, dict[str, Optional[float]]]:
         if not self.enabled:
